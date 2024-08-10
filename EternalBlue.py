@@ -5,8 +5,8 @@ import sys
 import socket
 
 '''
-EternalBlue exploit for Windows 8 and 2012 by xDevil
-The exploit might fail and crash a target system 
+EternalBlue exploit for Windows 8 and 2012 and Win10 by Shad0w
+The exploit might fail and crash a target system, most likely fixed on most Win10 Versions.
 The exploit support only x64 target
 Tested on:
 - Windows 2012 R2 x64
